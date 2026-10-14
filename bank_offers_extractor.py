@@ -9,6 +9,45 @@ from selenium import webdriver
 from selenium.webdriver.common.by import By
 
 
+_HEADER_XPATH = "//*[contains(text(), 'Bank offer') or contains(text(), 'Bank Offer')]"
+
+
+def _wait_for_offers_rendered(driver: webdriver.Chrome, max_wait: float = 2.5) -> bool:
+    """Wait until the bank-offer section has actually rendered offer text.
+
+    Replaces a fixed 2s sleep: returns as soon as the section shows an
+    offer-looking line (rupee amount + 'off'), and still gives up after
+    max_wait seconds so the worst case is about the same as before."""
+    end = time.time() + max_wait
+    while time.time() < end:
+        try:
+            headers = driver.find_elements(By.XPATH, _HEADER_XPATH)
+            if headers:
+                container = headers[0].find_element(By.XPATH, "./ancestor::div[6]")
+                txt = container.text
+                if '₹' in txt and 'off' in txt.lower():
+                    return True
+        except Exception:
+            pass
+        time.sleep(0.15)
+    return False
+
+
+def _wait_for_text_change(element, before_text: str, max_wait: float = 1.5) -> bool:
+    """Wait until element.text differs from before_text. Replaces a fixed 1.5s
+    sleep after each carousel click: returns the moment new offers render, and
+    returns False if nothing changed (carousel already at its end)."""
+    end = time.time() + max_wait
+    while time.time() < end:
+        try:
+            if element.text != before_text:
+                return True
+        except Exception:
+            return True  # element went stale -> DOM re-rendered, treat as changed
+        time.sleep(0.1)
+    return False
+
+
 def extract_bank_offers(driver: webdriver.Chrome, html: str, verbose: bool = False) -> list:
     """
     Extract bank offers from Flipkart product page.
@@ -25,8 +64,8 @@ def extract_bank_offers(driver: webdriver.Chrome, html: str, verbose: bool = Fal
     seen_offers = set()
     
     try:
-        # Wait for page to fully load and bank offers to render
-        time.sleep(2)  # Wait for bank offers to render
+        # Wait for bank offers to render (returns early once they are visible)
+        _wait_for_offers_rendered(driver)
         
         # Method 1: Scroll through carousel and extract all offers
         if verbose:
@@ -43,8 +82,8 @@ def extract_bank_offers(driver: webdriver.Chrome, html: str, verbose: bool = Fal
                         carousel_container = header.find_element(By.XPATH, "./ancestor::div[6]")
                         
                         # Scroll carousel container into view
-                        driver.execute_script("arguments[0].scrollIntoView({behavior: 'smooth', block: 'center'});", carousel_container)
-                        time.sleep(1)
+                        driver.execute_script("arguments[0].scrollIntoView({behavior: 'instant', block: 'center'});", carousel_container)
+                        time.sleep(0.2)
                         
                         # Find next/arrow buttons
                         next_buttons = carousel_container.find_elements(By.XPATH, 
@@ -123,6 +162,11 @@ def extract_bank_offers(driver: webdriver.Chrome, html: str, verbose: bool = Fal
                             # Try to scroll carousel
                             if next_buttons and scroll_round < 9:
                                 clicked = False
+                                changed = True
+                                try:
+                                    before_text = carousel_container.text
+                                except Exception:
+                                    before_text = None
                                 for btn in next_buttons:
                                     try:
                                         if btn.is_displayed() and btn.is_enabled():
@@ -130,19 +174,26 @@ def extract_bank_offers(driver: webdriver.Chrome, html: str, verbose: bool = Fal
                                             try:
                                                 # Strategy 1: Scroll button into view and JS click
                                                 driver.execute_script("arguments[0].scrollIntoView({behavior: 'instant', block: 'center'});", btn)
-                                                time.sleep(0.5)
+                                                time.sleep(0.15)
                                                 driver.execute_script("arguments[0].click();", btn)
                                                 clicked = True
                                                 if verbose:
                                                     print(f"    → Scrolled carousel (round {scroll_round + 1})")
-                                                time.sleep(1.5)  # Wait for new offers to load
+                                                # Wait only until new offers render (max 1.5s)
+                                                if before_text is not None:
+                                                    changed = _wait_for_text_change(carousel_container, before_text)
+                                                else:
+                                                    time.sleep(1.5)
                                                 break
                                             except:
                                                 try:
                                                     # Strategy 2: Direct click
                                                     btn.click()
                                                     clicked = True
-                                                    time.sleep(1.5)
+                                                    if before_text is not None:
+                                                        changed = _wait_for_text_change(carousel_container, before_text)
+                                                    else:
+                                                        time.sleep(1.5)
                                                     if verbose:
                                                         print(f"    → Scrolled carousel (round {scroll_round + 1})")
                                                     break
@@ -150,10 +201,15 @@ def extract_bank_offers(driver: webdriver.Chrome, html: str, verbose: bool = Fal
                                                     continue
                                     except:
                                         continue
-                                
+
                                 if not clicked:
                                     if verbose:
                                         print(f"    → Carousel scroll complete (no more buttons)")
+                                    break
+                                if not changed:
+                                    # Click produced no new content: carousel is at its end.
+                                    if verbose:
+                                        print(f"    → Carousel end reached (no new content after click)")
                                     break
                             else:
                                 if verbose and scroll_round >= 9:

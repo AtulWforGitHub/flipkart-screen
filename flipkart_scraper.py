@@ -452,12 +452,26 @@ class FlipkartScraper:
             proc_pid = None
         if proc_pid is not None:
             try:
-                # /T also kills the child Chrome processes so they don't leak.
-                subprocess.run(
-                    ["taskkill", "/F", "/T", "/PID", str(proc_pid)],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                    timeout=10,
-                )
+                if platform.system() == "Windows":
+                    # /T also kills the child Chrome processes so they don't leak.
+                    subprocess.run(
+                        ["taskkill", "/F", "/T", "/PID", str(proc_pid)],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                        timeout=10,
+                    )
+                else:
+                    # Linux/macOS (e.g. the Hostinger server): taskkill does not
+                    # exist there, so a wedged Chrome used to never be killed.
+                    # Kill chromedriver's children (Chrome) first, then chromedriver.
+                    subprocess.run(
+                        ["pkill", "-9", "-P", str(proc_pid)],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                        timeout=10,
+                    )
+                    try:
+                        os.kill(proc_pid, 9)
+                    except Exception:
+                        pass
             except Exception:
                 pass
         try:
@@ -535,6 +549,7 @@ class FlipkartScraper:
         """One scrape attempt. Returns a success dict (error=None, fsp/nep set),
         a CAPTCHA error dict, or an empty marker dict ({"_empty": True,
         "_html_len": N}). Runs inside the watchdog worker thread."""
+        t_start = time.time()
         driver = self._ensure_driver()
 
         # With page_load_strategy="none", get() returns almost immediately; set
@@ -603,12 +618,18 @@ class FlipkartScraper:
 
         if prices.get("fsp") or prices.get("nep"):
             # Extract bank offers; retry once if empty (carousel may not have rendered yet)
+            t_offers_start = time.time()
             bank_offers = self._extract_bank_offers(driver, html)
             if not bank_offers:
                 time.sleep(1.5)
                 bank_offers = self._extract_bank_offers(driver, html)
-            
+            t_end = time.time()
+
             return {
+                "timing": {
+                    "price_s":  round(t_offers_start - t_start, 1),  # page load + price read
+                    "offers_s": round(t_end - t_offers_start, 1),    # bank-offer carousel
+                },
                 "pid":    pid,
                 "name":   self._product_name(driver, html) or pid,
                 "fsp":    prices.get("fsp"),
@@ -632,22 +653,26 @@ class FlipkartScraper:
 
     @staticmethod
     def _dismiss_login_popup(driver: webdriver.Chrome) -> None:
-        for sel in (
-            "button._2KpZ6l._2doB4z", "button._30XB9F",
-            "span._30XB9F", "button[class*='_2doB4z']",
-        ):
-            try:
-                driver.find_element(By.CSS_SELECTOR, sel).click()
-                time.sleep(0.5)
-                return
-            except Exception:
-                pass
+        # One browser round-trip instead of one per <button> on the page
+        # (the old loop read .text of every button individually, which is slow).
         try:
-            for btn in driver.find_elements(By.TAG_NAME, "button"):
-                if btn.text.strip() in ("\u2715", "\u00d7", "x", "X"):
-                    btn.click()
-                    time.sleep(0.5)
-                    return
+            clicked = driver.execute_script(
+                """
+                const sels = ["button._2KpZ6l._2doB4z", "button._30XB9F",
+                              "span._30XB9F", "button[class*='_2doB4z']"];
+                for (const s of sels) {
+                    const el = document.querySelector(s);
+                    if (el) { el.click(); return true; }
+                }
+                const closers = ["\\u2715", "\\u00d7", "x", "X"];
+                for (const b of document.querySelectorAll('button')) {
+                    if (closers.includes((b.innerText || '').trim())) { b.click(); return true; }
+                }
+                return false;
+                """
+            )
+            if clicked:
+                time.sleep(0.2)
         except Exception:
             pass
 

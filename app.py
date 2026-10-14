@@ -220,6 +220,7 @@ def _fetch_prices(pid: str, lid: str = "", scraper=None) -> dict:
         return {"http_status": 200, "size_kb": 0,
                 "fsp": data.get("fsp"), "nep": data.get("nep"),
                 "bank_offers": data.get("bank_offers", []),
+                "timing": data.get("timing"),
                 "status_label": "OK" if (data.get("fsp") or data.get("nep")) else "NO_PRICE",
                 "error_msg": None,
                 "raw_html": data.get("raw_html")}
@@ -446,6 +447,47 @@ def broadcast(payload: dict):
             _clients.remove(q)
 
 
+# ── Per-product timing (shows where each cycle's time goes) ───────────────────
+_cycle_timings = {}        # pid -> wall seconds for the product (excluding gap sleep)
+_cycle_timing_detail = {}  # pid -> {"price_s":..., "offers_s":...} from the scraper
+
+
+def _timed_scrape_product(item: dict, gap: float, scraper=None):
+    t0 = time.time()
+    try:
+        _scrape_product(item, gap, scraper)
+    finally:
+        wall = max(0.0, time.time() - t0 - gap)
+        with _lock:
+            _cycle_timings[item["pid"]] = wall
+
+
+def _log_timing_summary(cycle_no: int, workers: int):
+    """One-line summary of where the cycle's time went. Deliberately does NOT
+    contain the text 'Cycle #' (hostinger_cycle_monitor.py greps for that)."""
+    with _lock:
+        timings = dict(_cycle_timings)
+        detail = dict(_cycle_timing_detail)
+        _cycle_timings.clear()
+        _cycle_timing_detail.clear()
+    if not timings:
+        return
+    walls = sorted(timings.values())
+    avg = sum(walls) / len(walls)
+    slow = sorted(timings.items(), key=lambda kv: kv[1], reverse=True)[:3]
+    slow_txt = ", ".join(f"{pid} {sec:.0f}s" for pid, sec in slow)
+    price_vals = [d["price_s"] for d in detail.values() if d.get("price_s") is not None]
+    offer_vals = [d["offers_s"] for d in detail.values() if d.get("offers_s") is not None]
+    split = ""
+    if price_vals and offer_vals:
+        split = (f" | avg page+price {sum(price_vals)/len(price_vals):.1f}s,"
+                 f" avg bank-offers {sum(offer_vals)/len(offer_vals):.1f}s")
+    activity_logger.info(
+        f"⏱ Timing summary (cycle {cycle_no}, {workers} worker(s)): {len(walls)} products, "
+        f"avg {avg:.1f}s, median {walls[len(walls)//2]:.1f}s, max {walls[-1]:.1f}s{split} | slowest: {slow_txt}"
+    )
+
+
 # ── Background scraper ────────────────────────────────────────────────────────
 def scrape_loop():
     cycle_count = 0
@@ -472,7 +514,7 @@ def scrape_loop():
 
         if worker_count == 1:
             for item in products_sorted:
-                _scrape_product(item, gap)
+                _timed_scrape_product(item, gap)
         else:
             batches = [products_sorted[i::worker_count] for i in range(worker_count)]
             workers = []
@@ -494,12 +536,13 @@ def scrape_loop():
         cycle_time = time.time() - cycle_start
         cycle_mins = cycle_time / 60
         activity_logger.info(f"🔄 Cycle #{cycle_count} completed: {len(products)} products in {cycle_mins:.1f} min ({cycle_time:.0f}s)")
+        _log_timing_summary(cycle_count, worker_count)
 
 
 def _scrape_batch(worker_id: int, batch: list, gap: float):
     scraper = _get_worker_scraper(worker_id)
     for item in batch:
-        _scrape_product(item, gap, scraper)
+        _timed_scrape_product(item, gap, scraper)
 
 
 def _scrape_product(item: dict, gap: float, scraper=None):
@@ -539,6 +582,9 @@ def _scrape_product(item: dict, gap: float, scraper=None):
         fetched = _fetch_prices(pid, lid, scraper=scraper)
         snapshot["http_status"] = fetched["http_status"]
         snapshot["size_kb"]     = fetched["size_kb"]
+        if fetched.get("timing"):
+            with _lock:
+                _cycle_timing_detail[pid] = fetched["timing"]
 
         if active_scraper is not None:
             browser_login = getattr(active_scraper, "login_confirmed", False)
