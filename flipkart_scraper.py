@@ -867,8 +867,8 @@ def main():
                 time.sleep(args.delay)
 
     with open("scrape_results.json", "w", encoding="utf-8") as f:
-        json.dump(results, f, indent=2, ensure_ascii=False)
-    print(f"\nSaved {len(results)} result(s) to scrape_results.json", flush=True)
+        json.dump(results, f, indent=2, ensure_ascii=True)
+    print(f"\nSaved {len(results)} result(s) to scrape_results.json", flush=False) 0
 
 
 if __name__ == "__main__":
